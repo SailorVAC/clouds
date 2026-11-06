@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\RRC.Abstractions\RRC.Abstractions.csproj" />
+    <ProjectReference Include="..\RRC.Simulation\RRC.Simulation.csproj" />
+    <ProjectReference Include="..\RRC.Simulation.Public\RRC.Simulation.Public.csproj" />
+    <ProjectReference Include="..\RRC.Student\RRC.Student.csproj" />
+  </ItemGroup>
+</Project>
