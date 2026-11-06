@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\SPS.Simulation\SPS.Simulation.csproj" />
+    <ProjectReference Include="..\SPS.Simulation.Public\SPS.Simulation.Public.csproj" />
+    <ProjectReference Include="..\SPS.Student\SPS.Student.csproj" />
+    <ProjectReference Include="..\SPS.Telemetry\SPS.Telemetry.csproj" />
+  </ItemGroup>
+</Project>
+
