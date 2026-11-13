@@ -7,7 +7,7 @@ using SPS.Student;
 using SPS.Telemetry;
 
 CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
-static ISystemPolicy CreateStudentPolicy() => new SampleSystemPolicy();
+static ISystemPolicy CreateStudentPolicy() => new MySystemPolicy();
 int seed = 42, traceCount = 0, stepMs = 0;
 string? recording = null;
 bool interactive = args.Length == 0 && !Console.IsInputRedirected;

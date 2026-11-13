@@ -1,262 +1,82 @@
-using System;
-using System.Collections.Generic;
-using System.Linq;
 using SPS.Abstractions;
 
-namespace SPS.Student
+namespace SPS.Student;
+
+public sealed class MySystemPolicy : ISystemPolicy
 {
-    public class MySystemPolicy : ISystemPolicy
+    private readonly Dictionary<string, double> popularity = new();
+    public IRequestPolicy RpcPolicy { get; } = new Rpc();
+
+    public CacheReadDecision OnCacheRead(CacheReadContext c, Random random)
     {
-        private int _targetApiCount = 2;
-        private int _targetWorkerCount = 2;
-        
-        // Подключаем вашу адаптивную политику повторов из первой лабы
-        public IRequestPolicy RpcPolicy { get; } = new AdaptiveRequestPolicy();
+        popularity.TryGetValue(c.Request.ResourceKey, out double hits);
+        popularity[c.Request.ResourceKey] = Math.Min(100, hits + 1);
+        if (c.Entry != null && c.Entry.ExpiresAt > c.Now &&
+            c.Now - c.Entry.SourceObservedAt + TimeSpan.FromMilliseconds(20) <= c.Request.MaxDataAge)
+            return CacheReadDecision.ServeCached();
+        var fetch = c.PendingFetches.OrderByDescending(f => f.StartedAt).FirstOrDefault();
+        if (fetch != null && c.Now - fetch.StartedAt < c.Request.MaxDataAge / 2)
+            return CacheReadDecision.JoinFetch(fetch.Id);
+        return CacheReadDecision.StartFetch();
+    }
 
-        // ---------------------------------------------------------
-        // 1. УПРАВЛЕНИЕ КЭШОМ
-        // ---------------------------------------------------------
-        public CacheReadDecision OnCacheRead(CacheReadContext context, Random random)
+    public CacheWriteDecision OnCacheFill(CacheFillContext c, Random random)
+    {
+        if (c.Value.SizeBytes > c.CapacityBytes) return CacheWriteDecision.Skip();
+        long size = c.Value.SizeBytes + c.Entries.Where(e => e.Key != c.Value.Key).Sum(e => e.SizeBytes);
+        var evict = new List<string>();
+        foreach (var entry in c.Entries.Where(e => e.Key != c.Value.Key)
+                     .OrderBy(e => popularity.GetValueOrDefault(e.Key) / Math.Max(1, e.SizeBytes)))
         {
-            if (context.Entry != null)
-            {
-                var age = context.Now - context.Entry.SourceObservedAt;
-                if (age <= context.Request.MaxDataAge)
-                {
-                    return CacheReadDecision.ServeCached();
-                }
-            }
-
-            if (context.PendingFetches != null && context.PendingFetches.Count > 0)
-            {
-                return CacheReadDecision.JoinFetch(context.PendingFetches[0].Id);
-            }
-
-            return CacheReadDecision.StartFetch();
+            if (size <= c.CapacityBytes) break;
+            size -= entry.SizeBytes;
+            evict.Add(entry.Key);
         }
+        return CacheWriteDecision.Retain(TimeSpan.FromSeconds(30), evict.ToArray());
+    }
 
-        public CacheWriteDecision OnCacheFill(CacheFillContext context, Random random)
+    public EndpointSelectionDecision? SelectEndpoint(RoutingContext c, Random random)
+    {
+        var endpoint = c.Endpoints.Where(e => e.State == InstanceState.Ready && e.Mode == EndpointMode.AllowTraffic)
+            .OrderBy(e => (e.OutstandingCalls + 1.0) / Math.Max(0.01, e.Speed * e.Slots)).FirstOrDefault();
+        return endpoint == null ? null : EndpointSelectionDecision.Assign(endpoint.Id);
+    }
+
+    public EndpointDecision ReviewEndpoint(EndpointContext c, Random random) => EndpointDecision.Allow();
+
+    public JobAssignmentDecision? SelectJobAssignment(JobSchedulingContext c, Random random)
+    {
+        var worker = c.AvailableWorkers.OrderByDescending(w => w.Speed).FirstOrDefault();
+        var job = c.QueuedJobs.OrderByDescending(j => (double)j.Request.Revenue /
+            Math.Max(0.1, j.Request.EstimatedWorkSeconds)).FirstOrDefault();
+        return worker == null || job == null ? null : JobAssignmentDecision.Assign(job.Id, worker.Id);
+    }
+
+    public JobRecoveryDecision ReviewJob(JobRecoveryContext c, Random random)
+    {
+        var last = c.Job.LastHeartbeat ?? c.Job.AssignedAt;
+        return last.HasValue && c.Now - last.Value > TimeSpan.FromSeconds(8)
+            ? JobRecoveryDecision.RequeueAfter(TimeSpan.Zero) : JobRecoveryDecision.KeepWaiting();
+    }
+
+    public CapacityPlan ReviewCapacity(CapacityContext c, Random random)
+    {
+        int apis = Math.Min(2, c.Settings.MaximumApis);
+        int workers = Math.Min(2, c.Settings.MaximumWorkers);
+        while (apis * c.Settings.Api.ComputeUnits + workers * c.Settings.Worker.ComputeUnits > c.Settings.ComputeUnitLimit)
         {
-            var ttl = TimeSpan.FromSeconds(5);
-            var keysToEvict = new List<string>();
-
-            long currentSize = context.Entries.Sum(e => e.SizeBytes) + context.Value.SizeBytes;
-            if (currentSize > context.CapacityBytes)
-            {
-                var sortedByAge = context.Entries.OrderBy(e => e.SourceObservedAt).ToList();
-                foreach (var entry in sortedByAge)
-                {
-                    keysToEvict.Add(entry.Key);
-                    currentSize -= entry.SizeBytes;
-                    if (currentSize <= context.CapacityBytes)
-                        break;
-                }
-            }
-
-            return CacheWriteDecision.Retain(ttl, keysToEvict.ToArray());
+            if (workers > 0) workers--; else if (apis > 0) apis--; else break;
         }
+        return new CapacityPlan(apis, workers);
+    }
 
-        // ---------------------------------------------------------
-        // 2. МАРШРУТИЗАЦИЯ И API
-        // ---------------------------------------------------------
-        public EndpointSelectionDecision SelectEndpoint(RoutingContext context, Random random)
-        {
-            var availableApis = context.Endpoints.Where(e => e.State == InstanceState.Ready).ToList();
-            
-            if (!availableApis.Any())
-                return null;
+    public void Observe(SystemObservation observation) { }
 
-            var bestApi = availableApis.OrderBy(e => e.OutstandingCalls).First();
-            return EndpointSelectionDecision.Assign(bestApi.Id);
-        }
-
-        public EndpointDecision ReviewEndpoint(EndpointContext context, Random random)
-        {
-            var recentFailures = context.RecentResults.Count(c => c.Outcome != RequestOutcome.Success);
-            
-            if (recentFailures > 2)
-            {
-                return EndpointDecision.Probe();
-            }
-
-            return EndpointDecision.Allow();
-        }
-
-        // ---------------------------------------------------------
-        // 3. УПРАВЛЕНИЕ ЗАДАНИЯМИ И WORKER'АМИ
-        // ---------------------------------------------------------
-        public JobAssignmentDecision SelectJobAssignment(JobSchedulingContext context, Random random)
-        {
-            if (!context.QueuedJobs.Any() || !context.AvailableWorkers.Any())
-                return null;
-
-            var availableWorkers = context.AvailableWorkers.Where(w => w.State == InstanceState.Ready && w.Slots > w.AssignedJobs).ToList();
-            
-            if (!availableWorkers.Any())
-                return null;
-
-            var bestWorker = availableWorkers.OrderByDescending(w => w.Slots - w.AssignedJobs).First();
-            var bestJob = context.QueuedJobs.OrderByDescending(j => j.Request.Revenue).First();
-
-            return JobAssignmentDecision.Assign(bestJob.Id, bestWorker.Id);
-        }
-
-        public JobRecoveryDecision ReviewJob(JobRecoveryContext context, Random random)
-        {
-            if (context.Job.LastHeartbeat.HasValue && (context.Now - context.Job.LastHeartbeat.Value).TotalSeconds > 5)
-            {
-                return JobRecoveryDecision.RequeueAfter(TimeSpan.Zero);
-            }
-            
-            return JobRecoveryDecision.KeepWaiting();
-        }
-
-        // ---------------------------------------------------------
-        // 4. МАСШТАБИРОВАНИЕ И БЮДЖЕТ (Capacity)
-        // ---------------------------------------------------------
-        public CapacityPlan ReviewCapacity(CapacityContext context, Random random)
-        {
-            int currentApis = context.Instances.Count(e => e.Role == InstanceRole.Api);
-            int currentWorkers = context.Instances.Count(e => e.Role == InstanceRole.Worker);
-
-            if (context.PendingCalls > currentApis * 5 && _targetApiCount < context.Settings.MaximumApis)
-            {
-                _targetApiCount++;
-            }
-            else if (context.PendingCalls == 0 && currentApis > 2)
-            {
-                _targetApiCount--;
-            }
-
-            if (context.QueuedJobs.Count > currentWorkers * 2 && _targetWorkerCount < context.Settings.MaximumWorkers)
-            {
-                _targetWorkerCount++;
-            }
-            else if (context.QueuedJobs.Count == 0 && currentWorkers > 2)
-            {
-                _targetWorkerCount--;
-            }
-
-            return new CapacityPlan(_targetApiCount, _targetWorkerCount);
-        }
-
-        // ---------------------------------------------------------
-        // 5. ОГРАНИЧЕНИЕ ВРЕМЕНИ ОБРАБОТКИ
-        // ---------------------------------------------------------
-        public TimeSpan? GetProcessingBudget(RequestInfo request, Random random)
-        {
-            switch (request.Kind)
-            {
-                case RequestKind.Metadata: return TimeSpan.FromSeconds(1.5);
-                case RequestKind.Preview: return TimeSpan.FromSeconds(3.0);
-                case RequestKind.Generate: return TimeSpan.FromSeconds(60.0);
-                default: return null;
-            }
-        }
-
-        // ---------------------------------------------------------
-        // 6. НАБЛЮДЕНИЕ
-        // ---------------------------------------------------------
-        public void Observe(SystemObservation observation)
-        {
-        }
-
-
-        // =========================================================
-        // АДАПТИВНАЯ ПОЛИТИКА ИЗ ПЕРВОЙ ЛАБОРАТОРНОЙ
-        // =========================================================
-        public sealed class AdaptiveRequestPolicy : IRequestPolicy
-        {
-            private const int SampleWindow = 256;
-            private const double LatencyQuantile = 0.95;
-            private const double SafetyFactor = 2.5;
-            private const int WarmupAttempts = 128;
-            private const int EstimateRefreshStep = 8;
-            private const int MaxAttempts = 3;
-            private const double RetryTimeoutGrowth = 2.0;
-
-            private const double PatienceGrowth = 1.5;
-            private const double PatienceDecay = 0.98;
-            private const double MaxPatience = 64.0;
-
-            private const double TimeoutRateSmoothing = 0.01;
-            private const double RetryTimeoutRateLimit = 0.15;
-
-            private static readonly TimeSpan MinimumTimeout = TimeSpan.FromMilliseconds(20);
-            private static readonly TimeSpan MaximumTimeout = TimeSpan.FromMinutes(2);
-
-            private readonly double[] _latencies = new double[SampleWindow];
-            private readonly double[] _sorted = new double[SampleWindow];
-            private int _sampleCount;
-            private int _nextSample;
-            private int _samplesSinceEstimate = EstimateRefreshStep;
-            private double _estimate;
-            private double _patience = 1.0;
-            private double _timeoutRate;
-
-            public TimeSpan GetTimeout(RequestContext context, Random random)
-            {
-                double estimate = _sampleCount < WarmupAttempts ? MaximumTimeout.Ticks : CurrentEstimate();
-                estimate *= _patience * GrowthForAttempt(context.Attempt);
-
-                if (double.IsNaN(estimate) || estimate < MinimumTimeout.Ticks) estimate = MinimumTimeout.Ticks;
-                if (estimate > MaximumTimeout.Ticks) estimate = MaximumTimeout.Ticks;
-                return TimeSpan.FromTicks((long)estimate);
-            }
-
-            public RetryDecision OnResult(RequestObservation observation, Random random)
-            {
-                bool timedOut = observation.Outcome == RequestOutcome.Timeout;
-                _timeoutRate += ((timedOut ? 1.0 : 0.0) - _timeoutRate) * TimeoutRateSmoothing;
-
-                if (timedOut)
-                {
-                    _patience = Math.Min(_patience * PatienceGrowth, MaxPatience);
-                    return CanRetry(observation.Attempt)
-                        ? RetryDecision.RetryAfter(TimeSpan.Zero)
-                        : RetryDecision.NoRetry();
-                }
-
-                Remember(Math.Max(1.0, observation.Elapsed.Ticks));
-                _patience = Math.Max(1.0, _patience * PatienceDecay);
-                return RetryDecision.NoRetry();
-            }
-
-            private bool CanRetry(int attempt)
-            {
-                if (attempt >= MaxAttempts) return false;
-                if (_timeoutRate > RetryTimeoutRateLimit) return false;
-                return true;
-            }
-
-            private static double GrowthForAttempt(int attempt)
-            {
-                if (attempt <= 1) return 1.0;
-                if (attempt >= 8) return 256.0;
-                return Math.Pow(RetryTimeoutGrowth, attempt - 1);
-            }
-
-            private double CurrentEstimate()
-            {
-                if (_samplesSinceEstimate >= EstimateRefreshStep)
-                {
-                    Array.Copy(_latencies, _sorted, _sampleCount);
-                    Array.Sort(_sorted, 0, _sampleCount);
-                    int index = (int)Math.Ceiling(LatencyQuantile * _sampleCount) - 1;
-                    if (index < 0) index = 0;
-                    _estimate = _sorted[index] * SafetyFactor;
-                    _samplesSinceEstimate = 0;
-                }
-                return _estimate;
-            }
-
-            private void Remember(double ticks)
-            {
-                _latencies[_nextSample] = ticks;
-                _nextSample = (_nextSample + 1) % SampleWindow;
-                if (_sampleCount < SampleWindow) _sampleCount++;
-                _samplesSinceEstimate++;
-            }
-        }
+    private sealed class Rpc : IRequestPolicy
+    {
+        public TimeSpan GetTimeout(RequestContext c, Random random) => TimeSpan.FromMilliseconds(400 * Math.Pow(2, Math.Min(2, Math.Max(0, c.Attempt - 1))));
+        public RetryDecision OnResult(RequestObservation o, Random random) =>
+            o.Attempt < 3 && o.Outcome is RequestOutcome.Timeout or RequestOutcome.Unavailable or RequestOutcome.Rejected
+                ? RetryDecision.RetryAfter(TimeSpan.FromMilliseconds(30 + random.Next(40))) : RetryDecision.NoRetry();
     }
 }
